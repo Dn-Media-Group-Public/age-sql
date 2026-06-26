@@ -1,0 +1,5 @@
+comment = 'AGE utilities: regexp matching and SQL execution from Cypher'
+default_version = '1.0'
+requires = 'age'
+schema = 'age_sql'
+relocatable = false
