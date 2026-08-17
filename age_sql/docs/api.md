@@ -92,6 +92,8 @@ age_sql.sql_row(
 ) RETURNS agtype   -- object {colname: value, …}, or null if no rows
 ```
 
+See also: [Plan: sql_row Nested Value Conversion](../../docs/implemented-plans/sql-row-nested-value-conversion.md)
+
 Executes `query` in the current transaction via SPI and returns the first row
 as an agtype object keyed by column name. Returns agtype `null` if the query
 returns no rows.
@@ -101,15 +103,22 @@ to positional `$1`, `$2`, … in order of first appearance. The `params` argumen
 must be an agtype object `{name: "value", …}`. All parameter values are passed
 as text and the query must cast them as needed (e.g. `$id::int`).
 
-**Return value** — column values are mapped to agtype as follows:
+**Return value** — column values are mapped to agtype as follows, recursively:
 
 | PostgreSQL type | agtype value |
 |-----------------|-------------|
 | `bool` | `true` / `false` |
 | `int2`, `int4`, `int8` | integer |
 | `float4`, `float8`, `numeric` | float |
+| `json`, `jsonb` | spliced in as a real nested agtype value (not a quoted string) |
+| 1-D array (`int[]`, `array_agg(...)`, ...) | agtype list, elements converted recursively; `NULL` elements become `null` |
+| composite / row type, incl. anonymous `ROW(...)` records | agtype map `{field: value, ...}`, fields converted recursively |
+| range type (`int4range`, `tstzrange`, ...) | agtype map `{"lower":..., "upper":..., "lower_inc":bool, "upper_inc":bool, "empty":bool}` — agtype has no native range type, so bounds are `null` when infinite or the range is empty |
 | everything else | string (via type output function) |
 | NULL | `null` |
+
+> **Limitation:** multi-dimensional arrays (`ARR_NDIM > 1`) are not supported
+> and raise an error — only 1-D arrays convert to agtype lists.
 
 **Cypher example:**
 

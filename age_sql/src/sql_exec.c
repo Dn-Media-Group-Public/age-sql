@@ -6,10 +6,13 @@
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rangetypes.h"
+#include "utils/typcache.h"
 #include "utils/agtype.h"
 
 /*
@@ -197,9 +200,44 @@ append_json_string(StringInfoData *buf, const char *str)
     appendStringInfoChar(buf, '"');
 }
 
+static void append_json_value(StringInfoData *buf, Datum datum, Oid typid, bool isnull);
+
+/* Append a JSON object {"col1":val1,...} for tuple's columns per tupdesc. */
+static void
+append_json_object(StringInfoData *buf, TupleDesc tupdesc, HeapTuple tuple)
+{
+    int ncols = tupdesc->natts;
+
+    appendStringInfoChar(buf, '{');
+
+    for (int i = 0; i < ncols; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        bool isnull;
+        Datum datum;
+
+        if (attr->attisdropped)
+            continue;
+
+        datum = heap_getattr(tuple, i + 1, tupdesc, &isnull);
+
+        if (i > 0)
+            appendStringInfoChar(buf, ',');
+
+        append_json_string(buf, NameStr(attr->attname));
+        appendStringInfoChar(buf, ':');
+        append_json_value(buf, datum, attr->atttypid, isnull);
+    }
+
+    appendStringInfoChar(buf, '}');
+}
+
 /*
  * Append a PostgreSQL column value to buf as a JSON value.
- * Numeric and bool types are emitted bare; everything else is text-quoted.
+ * Numeric and bool types are emitted bare; json/jsonb spliced unquoted;
+ * arrays become lists; composites/records become objects; ranges become
+ * a {lower,upper,lower_inc,upper_inc,empty} object; everything else is
+ * text-quoted.
  */
 static void
 append_json_value(StringInfoData *buf, Datum datum, Oid typid, bool isnull)
@@ -225,19 +263,7 @@ append_json_value(StringInfoData *buf, Datum datum, Oid typid, bool isnull)
             appendStringInfo(buf, INT64_FORMAT, DatumGetInt64(datum));
             return;
         case FLOAT4OID:
-        {
-            Oid out_func; bool is_varlena;
-            getTypeOutputInfo(typid, &out_func, &is_varlena);
-            appendStringInfoString(buf, OidOutputFunctionCall(out_func, datum));
-            return;
-        }
         case FLOAT8OID:
-        {
-            Oid out_func; bool is_varlena;
-            getTypeOutputInfo(typid, &out_func, &is_varlena);
-            appendStringInfoString(buf, OidOutputFunctionCall(out_func, datum));
-            return;
-        }
         case NUMERICOID:
         {
             Oid out_func; bool is_varlena;
@@ -245,15 +271,101 @@ append_json_value(StringInfoData *buf, Datum datum, Oid typid, bool isnull)
             appendStringInfoString(buf, OidOutputFunctionCall(out_func, datum));
             return;
         }
-        default:
+        case JSONOID:
+        case JSONBOID:
         {
             Oid out_func; bool is_varlena;
             getTypeOutputInfo(typid, &out_func, &is_varlena);
-            char *str = OidOutputFunctionCall(out_func, datum);
-            append_json_string(buf, str);
+            appendStringInfoString(buf, OidOutputFunctionCall(out_func, datum));
             return;
         }
+        default:
+            break;
     }
+
+    Oid elem_typid = get_element_type(typid);
+
+    if (OidIsValid(elem_typid))
+    {
+        ArrayType *arr = DatumGetArrayTypeP(datum);
+        int16 elmlen;
+        bool elmbyval;
+        char elmalign;
+        Datum *elems;
+        bool *nulls;
+        int nelems;
+
+        if (ARR_NDIM(arr) > 1)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("sql_row: multi-dimensional arrays are not supported")));
+
+        get_typlenbyvalalign(elem_typid, &elmlen, &elmbyval, &elmalign);
+        deconstruct_array(arr, elem_typid, elmlen, elmbyval, elmalign,
+                           &elems, &nulls, &nelems);
+
+        appendStringInfoChar(buf, '[');
+        for (int i = 0; i < nelems; i++)
+        {
+            if (i > 0)
+                appendStringInfoChar(buf, ',');
+            append_json_value(buf, elems[i], elem_typid, nulls[i]);
+        }
+        appendStringInfoChar(buf, ']');
+        return;
+    }
+
+    char typtype = get_typtype(typid);
+
+    if (typtype == TYPTYPE_COMPOSITE || typid == RECORDOID)
+    {
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(datum);
+        Oid rec_typid = HeapTupleHeaderGetTypeId(rec);
+        int32 rec_typmod = HeapTupleHeaderGetTypMod(rec);
+        TupleDesc rec_tupdesc = lookup_rowtype_tupdesc(rec_typid, rec_typmod);
+        HeapTupleData tmptup;
+
+        tmptup.t_len = HeapTupleHeaderGetDatumLength(rec);
+        tmptup.t_data = rec;
+
+        append_json_object(buf, rec_tupdesc, &tmptup);
+
+        ReleaseTupleDesc(rec_tupdesc);
+        return;
+    }
+
+    if (typtype == TYPTYPE_RANGE)
+    {
+        TypeCacheEntry *typcache = lookup_type_cache(typid, TYPECACHE_RANGE_INFO);
+        RangeType *range = DatumGetRangeTypeP(datum);
+        RangeBound lower;
+        RangeBound upper;
+        bool empty;
+
+        range_deserialize(typcache, range, &lower, &upper, &empty);
+
+        appendStringInfoString(buf, "{\"lower\":");
+        if (empty || lower.infinite)
+            appendStringInfoString(buf, "null");
+        else
+            append_json_value(buf, lower.val, typcache->rngelemtype->type_id, false);
+
+        appendStringInfoString(buf, ",\"upper\":");
+        if (empty || upper.infinite)
+            appendStringInfoString(buf, "null");
+        else
+            append_json_value(buf, upper.val, typcache->rngelemtype->type_id, false);
+
+        appendStringInfo(buf, ",\"lower_inc\":%s", lower.inclusive ? "true" : "false");
+        appendStringInfo(buf, ",\"upper_inc\":%s", upper.inclusive ? "true" : "false");
+        appendStringInfo(buf, ",\"empty\":%s}", empty ? "true" : "false");
+        return;
+    }
+
+    Oid out_func; bool is_varlena;
+    getTypeOutputInfo(typid, &out_func, &is_varlena);
+    char *str = OidOutputFunctionCall(out_func, datum);
+    append_json_string(buf, str);
 }
 
 Datum
@@ -338,30 +450,13 @@ age_sql_sql_row(PG_FUNCTION_ARGS)
     /* Collect first row into caller context before SPI_finish frees SPI memory */
     TupleDesc tupdesc = SPI_tuptable->tupdesc;
     HeapTuple tuple = SPI_tuptable->vals[0];
-    int ncols = tupdesc->natts;
 
     MemoryContext old = MemoryContextSwitchTo(caller_ctx);
 
     /* Build a JSON object string: {"col1": val1, "col2": val2, ...} */
     StringInfoData json;
     initStringInfo(&json);
-    appendStringInfoChar(&json, '{');
-
-    for (int i = 0; i < ncols; i++)
-    {
-        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-        bool isnull;
-        Datum datum = heap_getattr(tuple, i + 1, tupdesc, &isnull);
-
-        if (i > 0)
-            appendStringInfoChar(&json, ',');
-
-        append_json_string(&json, NameStr(attr->attname));
-        appendStringInfoChar(&json, ':');
-        append_json_value(&json, datum, attr->atttypid, isnull);
-    }
-
-    appendStringInfoChar(&json, '}');
+    append_json_object(&json, tupdesc, tuple);
 
     MemoryContextSwitchTo(old);
 
